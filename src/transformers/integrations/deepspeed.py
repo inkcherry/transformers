@@ -412,6 +412,10 @@ def deepspeed_init(trainer, num_training_steps, inference=False):
         model_parameters = None
     else:
         trainer.optimizer = None  # important for when deepspeed_init is used as re-init
+        tp_size = hf_deepspeed_config.config['zero_optimization'].get('autotp_size', 0)
+        if tp_size > 0:
+            import deepspeed
+            model=deepspeed.init_inference(model=model, mp_size=tp_size, dtype=hf_deepspeed_config.dtype(), replace_with_kernel_inject=False).module
         model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
         optimizer, lr_scheduler = deepspeed_optim_sched(
             trainer, hf_deepspeed_config, args, num_training_steps, model_parameters
