@@ -415,7 +415,7 @@ def deepspeed_init(trainer, num_training_steps, inference=False):
         tp_size = hf_deepspeed_config.config['zero_optimization'].get('autotp_size', 0)
         if tp_size > 0:
             import deepspeed
-            model=deepspeed.init_inference(model=model, mp_size=tp_size, dtype=hf_deepspeed_config.dtype(), replace_with_kernel_inject=False).module
+            model=deepspeed.tp_model_init(model=model, tp_size=tp_size, dtype=hf_deepspeed_config.dtype())
         model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
         optimizer, lr_scheduler = deepspeed_optim_sched(
             trainer, hf_deepspeed_config, args, num_training_steps, model_parameters
