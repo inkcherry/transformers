@@ -413,7 +413,7 @@ def deepspeed_init(trainer, num_training_steps, inference=False):
     else:
         trainer.optimizer = None  # important for when deepspeed_init is used as re-init
         tp_size = hf_deepspeed_config.config['zero_optimization'].get('autotp_size', 0)
-        if tp_size > 0:
+        if tp_size > 1:
             import deepspeed
             model=deepspeed.tp_model_init(model=model, tp_size=tp_size, dtype=hf_deepspeed_config.dtype())
         model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
