@@ -121,7 +121,7 @@ def _upad_input(
     else:
         # The -q_len: slice assumes left padding.
         attention_mask = attention_mask[:, -query_length:]
-        query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
+        query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, *_ = unpad_input(query_layer, attention_mask)
 
     return (
         query_layer,
@@ -137,9 +137,9 @@ def prepare_fa2_from_position_ids(query, key, value, position_ids):
     """
     This function returns necessary arguments to call `flash_attn_varlen_func`.
     All three query, key, value states will be flattened.
-    Cummulative lengths of each examples in the batch will be extracted from position_ids.
+    Cumulative lengths of each examples in the batch will be extracted from position_ids.
 
-    NOTE: ideally cummulative lengths should be prepared at the data collator stage
+    NOTE: ideally cumulative lengths should be prepared at the data collator stage
 
     Arguments:
         query (`torch.Tensor`):
@@ -209,7 +209,7 @@ def fa_peft_integration_check(
     if target_dtype is None:
         return query, key, value
 
-    input_dtype = value.dtype
+    input_dtype = query.dtype
     if input_dtype == torch.float32:
         logger.warning_once(
             f"The input hidden states seems to be silently casted in float32, this might be related to"
@@ -247,6 +247,7 @@ def _flash_attention_forward(
     max_length_q: Optional[int] = None,
     max_length_k: Optional[int] = None,
     target_dtype: Optional[torch.dtype] = None,
+    **kwargs,
 ):
     """
     Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
@@ -267,7 +268,7 @@ def _flash_attention_forward(
         softmax_scale (`float`, *optional*):
             The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
         use_top_left_mask (`bool`, defaults to `False`):
-            flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference.
+            flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignment, that was made default for flash_attn>=2.1. This attribute is used to handle this difference.
         softcap (`float`, *optional*):
             Softcap for the attention logits, used e.g. in gemma2.
         deterministic (`bool`, *optional*):
@@ -276,7 +277,7 @@ def _flash_attention_forward(
     if not use_top_left_mask:
         causal = is_causal
     else:
-        # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in transformers.models.llama.modeling_llama.LlamaFlashAttention2.__init__.
+        # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1.
         causal = is_causal and query_length != 1
 
     # Assuming 4D tensors, key_states.shape[1] is the key/value sequence length (source length).
@@ -373,9 +374,9 @@ class FlashAttentionKwargs(TypedDict, total=False):
 
     Attributes:
         cu_seq_lens_q (`torch.LongTensor`, *optional*)
-            Gets cumlative sequence length for query state.
+            Gets cumulative sequence length for query state.
         cu_seq_lens_k (`torch.LongTensor`, *optional*)
-            Gets cumlative sequence length for key state.
+            Gets cumulative sequence length for key state.
         max_length_q (`int`, *optional*):
             Maximum sequence length for query state.
         max_length_k (`int`, *optional*):

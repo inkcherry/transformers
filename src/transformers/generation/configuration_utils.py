@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 METADATA_FIELDS = ("_from_model_config", "_commit_hash", "_original_object_hash", "transformers_version")
-NEEDS_CACHE_CONFIG = {}
+CACHE_CONFIG_MAPPING = {}
 NEED_SETUP_CACHE_CLASSES_MAPPING = {}
 QUANT_BACKEND_CLASSES_MAPPING = {}
 ALL_CACHE_IMPLEMENTATIONS = []
@@ -62,8 +62,8 @@ if is_torch_available():
     )
     from .logits_process import SynthIDTextWatermarkLogitsProcessor, WatermarkLogitsProcessor
 
-    NEEDS_CACHE_CONFIG["quantized"] = QuantizedCacheConfig
-    NEEDS_CACHE_CONFIG["static"] = StaticCacheConfig
+    CACHE_CONFIG_MAPPING["quantized"] = QuantizedCacheConfig
+    CACHE_CONFIG_MAPPING["static"] = StaticCacheConfig
     NEED_SETUP_CACHE_CLASSES_MAPPING = {
         "static": StaticCache,
         "offloaded_static": OffloadedStaticCache,
@@ -73,7 +73,7 @@ if is_torch_available():
     }
     QUANT_BACKEND_CLASSES_MAPPING = {"quanto": QuantoQuantizedCache, "HQQ": HQQQuantizedCache}
     ALL_CACHE_IMPLEMENTATIONS = (
-        list(NEED_SETUP_CACHE_CLASSES_MAPPING.keys()) + list(NEEDS_CACHE_CONFIG.keys()) + ["offloaded"]
+        list(NEED_SETUP_CACHE_CLASSES_MAPPING.keys()) + list(CACHE_CONFIG_MAPPING.keys()) + ["offloaded", "dynamic"]
     )
 
 
@@ -175,6 +175,7 @@ class GenerationConfig(PushToHubMixin):
         cache_implementation (`str`, *optional*, default to `None`):
             Name of the cache class that will be instantiated in `generate`, for faster decoding. Possible values are:
 
+            - `"dynamic"`: [`DynamicCache`]
             - `"static"`: [`StaticCache`]
             - `"offloaded_static"`: [`OffloadedStaticCache`]
             - `"sliding_window"`: [`SlidingWindowCache`]
@@ -182,9 +183,8 @@ class GenerationConfig(PushToHubMixin):
             - `"mamba"`: [`MambaCache`]
             - `"quantized"`: [`QuantizedCache`]
 
-            We support other cache types, but they must be manually instantiated and
-            passed to `generate` through the `past_key_values` argument. See our
-            [cache documentation](https://huggingface.co/docs/transformers/en/kv_cache) for further information.
+            If none is specified, we will use the default cache for the model (which is often [`DynamicCache`]). See
+            our [cache documentation](https://huggingface.co/docs/transformers/en/kv_cache) for further information.
         cache_config (`CacheConfig` or `dict`, *optional*, default to `None`):
             Arguments used in the key-value cache class can be passed in `cache_config`. Can be passed as a `Dict` and
             it will be converted to its repsective `CacheConfig` internally.
@@ -195,12 +195,12 @@ class GenerationConfig(PushToHubMixin):
         > Parameters for manipulation of the model output logits
 
         temperature (`float`, *optional*, defaults to 1.0):
-            The value used to modulate the next token probabilities.
+            The value used to module the next token probabilities. This value is set in a model's `generation_config.json` file. If it isn't set, the default value is 1.0
         top_k (`int`, *optional*, defaults to 50):
-            The number of highest probability vocabulary tokens to keep for top-k-filtering.
+            The number of highest probability vocabulary tokens to keep for top-k-filtering. This value is set in a model's `generation_config.json` file. If it isn't set, the default value is 50.
         top_p (`float`, *optional*, defaults to 1.0):
             If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to
-            `top_p` or higher are kept for generation.
+            `top_p` or higher are kept for generation. This value is set in a model's `generation_config.json` file. If it isn't set, the default value is 1.0
         min_p (`float`, *optional*):
             Minimum token probability, which will be scaled by the probability of the most likely token. It must be a
             value between 0 and 1. Typical values are in the 0.01-0.2 range, comparably selective as setting `top_p` in
@@ -353,7 +353,9 @@ class GenerationConfig(PushToHubMixin):
         assistant_confidence_threshold (`float`, *optional*, defaults to 0.4):
             The confidence threshold for the assistant model. If the assistant model's confidence in its prediction for the current token is lower
             than this threshold, the assistant model stops the current token generation iteration, even if the number of _speculative tokens_
-            (defined by `num_assistant_tokens`) is not yet reached. It is an unsupervised version of the dynamic speculation lookahead
+            (defined by `num_assistant_tokens`) is not yet reached. The assistant's confidence threshold is adjusted throughout the speculative iterations to reduce the number of unnecessary draft and target forward passes, biased towards avoiding false negatives.
+            `assistant_confidence_threshold` value is persistent over multiple generation calls with the same assistant model.
+            It is an unsupervised version of the dynamic speculation lookahead
             from Dynamic Speculation Lookahead Accelerates Speculative Decoding of Large Language Models <https://arxiv.org/abs/2405.04304>.
         prompt_lookup_num_tokens (`int`, *optional*):
             The number of tokens to be output as candidate tokens.
@@ -376,6 +378,8 @@ class GenerationConfig(PushToHubMixin):
         compile_config (CompileConfig, *optional*):
             If using a static cache, this controls how `generate` will `compile` the forward pass for performance
             gains.
+
+        disable_compile (`bool`, *optional*): Whether to disable the automatic compilation of the forward pass. Automatic compilation happens when specific criteria are met, including using a compileable cache. Please open an issue if you find the need to use this flag.
 
         > Wild card
 
@@ -407,11 +411,9 @@ class GenerationConfig(PushToHubMixin):
         self.use_cache = kwargs.pop("use_cache", True)
         self.cache_implementation = kwargs.pop("cache_implementation", None)
         self.cache_config = kwargs.pop("cache_config", None)
-        if self.cache_implementation is not None and self.cache_implementation in NEEDS_CACHE_CONFIG:
-            cache_config_class = NEEDS_CACHE_CONFIG[self.cache_implementation]
-            if self.cache_config is None:
-                self.cache_config = cache_config_class()
-            elif isinstance(self.cache_config, dict):
+        if self.cache_implementation is not None and self.cache_implementation in CACHE_CONFIG_MAPPING:
+            cache_config_class = CACHE_CONFIG_MAPPING[self.cache_implementation]
+            if isinstance(self.cache_config, dict):
                 self.cache_config = cache_config_class.from_dict(self.cache_config)
         self.return_legacy_cache = kwargs.pop("return_legacy_cache", None)
 
@@ -480,9 +482,9 @@ class GenerationConfig(PushToHubMixin):
         self.assistant_lookbehind = kwargs.pop("assistant_lookbehind", 10)
         self.target_lookbehind = kwargs.pop("target_lookbehind", 10)
 
-        # Performances
+        # Performance
         self.compile_config = kwargs.pop("compile_config", CompileConfig())
-
+        self.disable_compile = kwargs.pop("disable_compile", False)
         # Wild card
         self.generation_kwargs = kwargs.pop("generation_kwargs", {})
 
@@ -764,7 +766,7 @@ class GenerationConfig(PushToHubMixin):
                 f"{ALL_CACHE_IMPLEMENTATIONS}"
             )
         if self.cache_config is not None:
-            cache_class = NEEDS_CACHE_CONFIG.get(self.cache_implementation)
+            cache_class = CACHE_CONFIG_MAPPING.get(self.cache_implementation)
             if cache_class is None:
                 raise ValueError(
                     "You provided a `cache_config` but the cache implementation you are using "
@@ -785,8 +787,7 @@ class GenerationConfig(PushToHubMixin):
             for arg_name in ("cache_implementation", "cache_config", "return_legacy_cache"):
                 if getattr(self, arg_name) is not None:
                     logger.warning_once(
-                        no_cache_warning.format(cache_arg=arg_name, cache_arg_value=getattr(self, arg_name)),
-                        UserWarning,
+                        no_cache_warning.format(cache_arg=arg_name, cache_arg_value=getattr(self, arg_name))
                     )
 
         # 6.  check watermarking arguments
@@ -1579,7 +1580,7 @@ class SynthIDTextWatermarkingConfig(BaseWatermarkingConfig):
 
 
 @dataclass
-class CompileConfig(object):
+class CompileConfig:
     """
     Class that holds arguments relative to `torch.compile` behavior, when using automatic compilation in `generate`.
     See [`torch.compile`](https://pytorch.org/docs/stable/generated/torch.compile.html) for more details on the arguments.
@@ -1620,7 +1621,9 @@ class CompileConfig(object):
     backend: Union[str, Callable] = "inductor"
     mode: str = "reduce-overhead"
     options: Optional[dict] = None
+    # Used to flag our `generate` call to compile on e.g. CPU. Often not optimal, but useful for testing purposes.
+    _compile_all_devices = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes this instance to a Python dictionary."""
-        return copy.deepcopy(self.__dict__)
+        return copy.deepcopy({key: value for key, value in self.__dict__.items() if key != "_compile_all_devices"})
