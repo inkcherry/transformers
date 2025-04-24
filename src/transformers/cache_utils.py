@@ -429,6 +429,16 @@ class DynamicCache(Cache):
                 for _ in range(len(self.key_cache), layer_idx):
                     self.key_cache.append([])
                     self.value_cache.append([])
+                # key_states_fp8=key_states.to(torch.float8_e4m3fn)
+                # value_states_fp8=value_states.to(torch.float8_e4m3fn)
+                # key_states_fp16=key_states_fp8.to(torch.float16)
+                # value_states_fp16=value_states_fp8.to(torch.float16)
+                
+                
+                
+                # self.key_cache.append(key_states_fp16)
+                # self.value_cache.append(value_states_fp16)
+                
                 self.key_cache.append(key_states)
                 self.value_cache.append(value_states)
             elif (

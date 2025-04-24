@@ -216,7 +216,58 @@ def eager_attention_forward(
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
+    
+    # socre_last2k=torch.matmul(query[:,:,-2048:,:], key_states.transpose(2, 3)) 
+    # chunk_size=2k
+    len=[]
+    chunk_size = 2048
+    B, num_heads, Q_len, dim = query.shape  # 假设 query 是 (B, H, Q_len, D)
+    _, _, K_len, _ = key_states.shape
+    attn_weights_all=[]
+    
+    #[b(1), seq_len]
+    final_score = torch.zeros(Q_len,dtype=query.dtype, device=query.device)
+    
+    #[n_head, seq_len,seq_len]
+    
+    for start in range(0, Q_len, chunk_size): #B, H, Q_len, D
+        print("cc")
+        end = min(start + chunk_size, Q_len)
+        query_chunk = query[:, :, start:end, :]  # shape: (B, H, chunk_len, D)
+
+        # key_states.transpose(2, 3): shape becomes (B, H, D, K_len)
+        attn_weights_chunk = torch.matmul(query_chunk, key_states.transpose(2, 3)) * scaling  # (B, H, chunk_len, K_len)
+
+        if attention_mask is not None:
+            # Slice对应 chunk 的 causal_mask
+            chunk_causal_mask = attention_mask[:, :, start:end, :K_len]  # 注意这里的 start:end
+            attn_weights_chunk = attn_weights_chunk + chunk_causal_mask
+        
+        
+        # tmp_sigmoid =  nn.functional.sigmoid(attn_weights_chunk).to(query.dtype)
+        tmp_sigmoid = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query.dtype)
+
+        #B, H, Q_len_chunk, Q_len
+        tmp_sigmoid_max_by_head = tmp_sigmoid.max(dim=1).values
+        #B Q_len_chunk,Q_len
+        
+        row_max = tmp_sigmoid_max_by_head.max(dim=1).values  # [L1]
+        # 按列取 max（key 视角）
+        col_max = tmp_sigmoid_max_by_head.max(dim=2).values  # [L2]
+
+        attn_weights_chunk = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query.dtype)
+
+        attn_weights_all.append(attn_weights_chunk)
+        final_score=torch.max(final_score,row_max[0,:])
+        final_score[start:end]=torch.max(final_score[start:end],col_max[0,:] )
+        b=0
+        
+        
+
+    attn_weights_tmp = torch.cat(attn_weights_all, dim=2) 
+    
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
@@ -273,7 +324,6 @@ class LlamaAttention(nn.Module):
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
