@@ -430,7 +430,12 @@ class LlamaAttention(nn.Module):
 
         seq_len = query_states.shape[2]
         
-        
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
@@ -441,7 +446,7 @@ class LlamaAttention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if   False:  # 仅生成阶段且长度超限时分块
+        if   PREFILL:  # 仅生成阶段且长度超限时分块
             # 初始化输出 & 分块次数
             attn_output_chunk = torch.zeros_like(query_states).transpose(1,2)
             num_chunks = (seq_len + CHUNK_THRESHOLD - 1) // CHUNK_THRESHOLD
@@ -494,11 +499,6 @@ class LlamaAttention(nn.Module):
         
         score =None
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
 
 
         
@@ -514,17 +514,18 @@ class LlamaAttention(nn.Module):
             
             key_states,value_states=fp8_quant_by_score(score,key_states,value_states,ratio=0.8)
                         
-        
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+        else:
+            #decode
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
         if   False:
             if not torch.allclose(attn_output, attn_output_chunk):
                 print("!!!wcwcwc")
