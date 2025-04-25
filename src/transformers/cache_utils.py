@@ -446,7 +446,7 @@ class DynamicCache(Cache):
             ):  # fills previously skipped layers; checking for tensor causes errors
                 self.key_cache[layer_idx] = key_states
                 self.value_cache[layer_idx] = value_states
-            else:
+            else: #prefill
                 self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
                 self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
 
