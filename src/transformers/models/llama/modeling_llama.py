@@ -281,6 +281,67 @@ def get_attn_score(
         tmp_sigmoid_max_by_head = tmp_sigmoid.max(dim=1).values
         #B Q_len_chunk,Q_len
         
+        # row_max = tmp_sigmoid_max_by_head.max(dim=1).values  # [L1]
+        # 按列取 max（key 视角）
+        col_max = tmp_sigmoid_max_by_head.max(dim=2).values  # [L2]
+
+        # attn_weights_chunk = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query.dtype)
+
+        # attn_weights_all.append(attn_weights_chunk)
+        # final_score=torch.max(final_score,row_max[0,:])
+        final_score[start:end]=torch.max(final_score[start:end],col_max[0,:] )
+        b=0
+    return final_score
+        
+def get_attn_score_all(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    
+    # socre_last2k=torch.matmul(query[:,:,-2048:,:], key_states.transpose(2, 3)) 
+    # chunk_size=2k
+    len=[]
+    chunk_size = 1024
+    B, num_heads, Q_len, dim = query.shape  # 假设 query 是 (B, H, Q_len, D)
+    _, _, K_len, _ = key_states.shape
+    attn_weights_all=[]
+    
+    #[b(1), seq_len]
+    final_score = torch.zeros(Q_len,dtype=query.dtype, device=query.device)
+    
+    #[n_head, seq_len,seq_len]
+    
+    for start in range(0, Q_len, chunk_size): #B, H, Q_len, D
+        # print("cc")
+        end = min(start + chunk_size, Q_len)
+        query_chunk = query[:, :, start:end, :]  # shape: (B, H, chunk_len, D)
+
+        # key_states.transpose(2, 3): shape becomes (B, H, D, K_len)
+        attn_weights_chunk = torch.matmul(query_chunk, key_states.transpose(2, 3)) * scaling  # (B, H, chunk_len, K_len)
+
+        if attention_mask is not None:
+            # Slice对应 chunk 的 causal_mask
+            chunk_causal_mask = attention_mask[:, :, start:end, :K_len]  # 注意这里的 start:end
+            attn_weights_chunk = attn_weights_chunk + chunk_causal_mask
+        
+        
+        # tmp_sigmoid =  nn.functional.sigmoid(attn_weights_chunk).to(query.dtype)
+        tmp_sigmoid = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query.dtype)
+
+        #B, H, Q_len_chunk, Q_len
+        tmp_sigmoid_max_by_head = tmp_sigmoid.max(dim=1).values
+        #B Q_len_chunk,Q_len
+        
         row_max = tmp_sigmoid_max_by_head.max(dim=1).values  # [L1]
         # 按列取 max（key 视角）
         col_max = tmp_sigmoid_max_by_head.max(dim=2).values  # [L2]
@@ -292,7 +353,6 @@ def get_attn_score(
         final_score[start:end]=torch.max(final_score[start:end],col_max[0,:] )
         b=0
     return final_score
-        
         
     
 def eager_attention_forward(
@@ -416,9 +476,7 @@ class LlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        query_states_bk=query_states.clone()
-        key_states_bk=key_states.clone()
-        value_states_bk=value_states.clone()
+  
         PREFILL=False
         if hidden_shape[1]>1:
             PREFILL=True
@@ -430,7 +488,7 @@ class LlamaAttention(nn.Module):
 
         seq_len = query_states.shape[2]
         
-        if past_key_value is not None:
+        if not PREFILL and past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -445,7 +503,7 @@ class LlamaAttention(nn.Module):
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
+        
         if   PREFILL:  # 仅生成阶段且长度超限时分块
             # 初始化输出 & 分块次数
             attn_output_chunk = torch.zeros_like(query_states).transpose(1,2)
@@ -475,6 +533,8 @@ class LlamaAttention(nn.Module):
                     mask_chunk = None
                 
                 # 调用原始Attention接口
+                
+                
                 chunk_out, chunk_weights = attention_interface(
                     self,
                     query_chunk,
@@ -486,36 +546,52 @@ class LlamaAttention(nn.Module):
                     **kwargs
                 )
                 
+                #添加一个全量化
+                if True:
+                    #score量化
+                    score= get_attn_score(self,
+                        query_chunk,
+                        key_chunk,
+                        value_chunk,
+                        mask_chunk,
+                        dropout=0.0 if not self.training else self.attention_dropout,
+                        scaling=self.scaling,
+                        **kwargs,)
+                
+                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=0.8)
+                    key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
+                    value_states[:, :, start:end, :]=value_out 
+                #全量化
+                if False:
+                    score= torch.ones(key_states[:, :, start:end, :].shape[2],dtype=key_states.dtype, device=key_states.device)
+                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=1)
+                    key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
+                    value_states[:, :, start:end, :]=value_out 
+                
                 # 累积输出
                 attn_output_chunk[:,  start:end, :,:] = chunk_out
-                b=0
 
-            
+        
+
+            attn_output=attn_output_chunk
+            attn_weights= None
+            #最后更新cache， fp量化完成后。
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+
+                    
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights
         #-------chunk化
 
    
         #有历史的。
         
         
-        score =None
-
-
-
-        
-        if False:
-            score= get_attn_score(self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                **kwargs,)
-            
-            key_states,value_states=fp8_quant_by_score(score,key_states,value_states,ratio=0.8)
-                        
-        else:
-            #decode
+        elif not PREFILL:
             attn_output, attn_weights = attention_interface(
                 self,
                 query_states,
@@ -526,12 +602,16 @@ class LlamaAttention(nn.Module):
                 scaling=self.scaling,
                 **kwargs,
             )
-        if   False:
-            if not torch.allclose(attn_output, attn_output_chunk):
-                print("!!!wcwcwc")
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+            
+        
+        #just set decode path to prefill aging to check the correct.
+        # # if   False:
+        # if PREFILL:
+        #     if not torch.allclose(attn_output, attn_output_chunk):
+                
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights
 
 
 class LlamaDecoderLayer(nn.Module):
