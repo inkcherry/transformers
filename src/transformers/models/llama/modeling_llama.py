@@ -203,7 +203,10 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def fp8_quant_by_score(score, key_states, v_states, ratio):
+def fp8_quant_by_score(score, key_states, v_states, ratio, is_int4=False):
+    #chunk prefill的小尾巴，如果太小了，不进行单独量化。
+    if score.shape[0]<10:
+        return key_states,v_states
     num_fp8 = int(score.shape[0] * ratio)
 
     # 获取分数最小的 token 的 indices
@@ -225,12 +228,41 @@ def fp8_quant_by_score(score, key_states, v_states, ratio):
         selected=(selected_scaled).to(torch.float16)* scale # 再转回 BF16
         x_fp8[:,:,mask,:] = selected  
         return x_fp8
+    def quantize_selected_int4(x, mask, max_int4_val=7.0):
+        # x: (b, n, s, h)
+        x_int4 = x.clone()
+        selected = x[:, :, mask, :]  # 被选中需要量化的部分
+
+        if selected.numel() == 0:
+            return x_int4  # 防止空 tensor 出错
+
+        # 计算scale：按token级别找到最大绝对值，防止溢出
+        scale = selected.abs().amax(dim=(-1, -2), keepdim=True).clamp(min=1e-7) / max_int4_val
+
+        # 归一化
+        selected_scaled = selected / scale  # 现在理论上是 [-7, 7]
+
+        # 量化到 int4范围，并且四舍五入
+        selected_quant = selected_scaled.round().clamp(min=-8, max=7).to(torch.int8)  # int8存储，但只用到[-8,7]
+
+        # 反量化回 float16
+        selected_dequant = (selected_quant.to(torch.float16)) * scale
+
+        # 把量化再还原的值写回去
+        x_int4[:, :, mask, :] = selected_dequant
+
+        return x_int4
     
+    if is_int4 is True:
+        key_states2=quantize_selected_int4(key_states, mask)
+        v_states2=quantize_selected_int4(v_states,mask)
+        return key_states2,v_states2
+
+    else:
+        key_states2=quantize_selected(key_states, mask)
+        v_states2=quantize_selected(v_states,mask)
     
-    key_states2=quantize_selected(key_states, mask)
-    v_states2=quantize_selected(v_states,mask)
-    
-    return key_states,v_states
+        return key_states2,v_states2
     
 def get_attn_score(
     module: nn.Module,
@@ -445,7 +477,21 @@ class LlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-
+        
+        
+        self.ratio=None
+        self.is_int4 =False
+        if self.is_int4:
+            self.ratio=0.5
+        elif not self.is_int4:
+            self.ratio=0.8
+        else:
+            assert False
+            
+        self.quant_level=2  #0 no quant,  1 our method ,2 full
+        if self.quant_level==2:
+            self.ratio=1.0
+        print(" is_int4:", self.is_int4, " quant_level:", self.quant_level, " ratio:",self.ratio)
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
@@ -546,8 +592,7 @@ class LlamaAttention(nn.Module):
                     **kwargs
                 )
                 
-                #添加一个全量化
-                if True:
+                if self.quant_level==1:
                     #score量化
                     score= get_attn_score(self,
                         query_chunk,
@@ -558,13 +603,13 @@ class LlamaAttention(nn.Module):
                         scaling=self.scaling,
                         **kwargs,)
                 
-                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=0.8)
-                    key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
-                    value_states[:, :, start:end, :]=value_out 
+                    # key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=self.ratio, is_int4=self.is_int4 )
+                    # key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
+                    # value_states[:, :, start:end, :]=value_out 
                 #全量化
-                if False:
+                if self.quant_level==2:
                     score= torch.ones(key_states[:, :, start:end, :].shape[2],dtype=key_states.dtype, device=key_states.device)
-                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=1)
+                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=self.ratio,is_int4=self.is_int4 )
                     key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
                     value_states[:, :, start:end, :]=value_out 
                 
