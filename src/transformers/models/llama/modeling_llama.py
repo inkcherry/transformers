@@ -485,17 +485,21 @@ class LlamaAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         
-        
+        import os
+        self.is_int4 = os.getenv("IS_INT4", "True") == "True"  # 默认为True
+        self.quant_level = int(os.getenv("QUANT_LEVEL", 0))  # 默认为0
         self.ratio=None
+        
         self.is_int4 =True
         if self.is_int4:
-            self.ratio=0.8
+            self.ratio=0.65
         elif not self.is_int4:
             self.ratio=0.8
         else:
             assert False
-            
-        self.quant_level=1  #0 no quant,  1 our method ,2 full
+        self.ratio = float(os.getenv("RATIO", self.ratio))  # 默认为0.65
+
+        # self.quant_level=3  #0 no quant,  1 our method ,2 full 3 random
         if self.quant_level==2:
             self.ratio=1.0
         print(" is_int4:", self.is_int4, " quant_level:", self.quant_level, " ratio:",self.ratio)
@@ -619,7 +623,12 @@ class LlamaAttention(nn.Module):
                     key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=self.ratio,is_int4=self.is_int4 )
                     key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
                     value_states[:, :, start:end, :]=value_out 
-                
+                if self.quant_level==3:
+                    score= torch.rand(key_states[:, :, start:end, :].shape[2],dtype=key_states.dtype, device=key_states.device)
+                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=self.ratio, is_int4=self.is_int4 )
+                    key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
+                    value_states[:, :, start:end, :]=value_out 
+
                 # 累积输出
                 attn_output_chunk[:,  start:end, :,:] = chunk_out
 
