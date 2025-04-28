@@ -309,20 +309,27 @@ def get_attn_score(
         # tmp_sigmoid =  nn.functional.sigmoid(attn_weights_chunk).to(query.dtype)
         tmp_sigmoid = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query.dtype)
 
+        
+        
+        # 按照max取
         #B, H, Q_len_chunk, Q_len
-        tmp_sigmoid_max_by_head = tmp_sigmoid.max(dim=1).values
+        # tmp_sigmoid_max_by_head = tmp_sigmoid.max(dim=1).values
+        tmp_sigmoid_max_by_head = tmp_sigmoid.mean(dim=1)
+
         #B Q_len_chunk,Q_len
         
         # row_max = tmp_sigmoid_max_by_head.max(dim=1).values  # [L1]
         # 按列取 max（key 视角）
-        col_max = tmp_sigmoid_max_by_head.max(dim=2).values  # [L2]
+        # col_max = tmp_sigmoid_max_by_head.sum(dim=2)  # [L2]
+        row_max = tmp_sigmoid_max_by_head.sum(dim=1)  # [L2]
 
         # attn_weights_chunk = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query.dtype)
 
         # attn_weights_all.append(attn_weights_chunk)
         # final_score=torch.max(final_score,row_max[0,:])
-        final_score[start:end]=torch.max(final_score[start:end],col_max[0,:] )
-        b=0
+        final_score[start:end] = torch.add(final_score[start:end], row_max[0, start:end])
+
+        
     return final_score
         
 def get_attn_score_all(
@@ -480,7 +487,7 @@ class LlamaAttention(nn.Module):
         
         
         self.ratio=None
-        self.is_int4 =False
+        self.is_int4 =True
         if self.is_int4:
             self.ratio=0.5
         elif not self.is_int4:
@@ -488,7 +495,7 @@ class LlamaAttention(nn.Module):
         else:
             assert False
             
-        self.quant_level=2  #0 no quant,  1 our method ,2 full
+        self.quant_level=1  #0 no quant,  1 our method ,2 full
         if self.quant_level==2:
             self.ratio=1.0
         print(" is_int4:", self.is_int4, " quant_level:", self.quant_level, " ratio:",self.ratio)
@@ -603,9 +610,9 @@ class LlamaAttention(nn.Module):
                         scaling=self.scaling,
                         **kwargs,)
                 
-                    # key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=self.ratio, is_int4=self.is_int4 )
-                    # key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
-                    # value_states[:, :, start:end, :]=value_out 
+                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=self.ratio, is_int4=self.is_int4 )
+                    key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
+                    value_states[:, :, start:end, :]=value_out 
                 #全量化
                 if self.quant_level==2:
                     score= torch.ones(key_states[:, :, start:end, :].shape[2],dtype=key_states.dtype, device=key_states.device)
