@@ -489,7 +489,7 @@ class LlamaAttention(nn.Module):
         self.ratio=None
         self.is_int4 =True
         if self.is_int4:
-            self.ratio=0.5
+            self.ratio=0.8
         elif not self.is_int4:
             self.ratio=0.8
         else:
