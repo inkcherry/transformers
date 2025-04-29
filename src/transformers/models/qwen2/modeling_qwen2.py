@@ -128,7 +128,134 @@ def eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
+def fp8_quant_by_score(score, key_states, v_states, ratio, is_int4=False):
+    #chunk prefill的小尾巴，如果太小了，不进行单独量化。
+    if score.shape[0]<10:
+        return key_states,v_states
+    num_fp8 = int(score.shape[0] * ratio)
 
+    # 获取分数最小的 token 的 indices
+    _, indices = torch.topk(score, num_fp8, largest=False)
+
+    mask = torch.zeros(score.shape[0], dtype=torch.bool, device=score.device)
+    mask[indices] = True
+    
+    def quantize_selected(x, mask,max_fp8_val=448.0):
+        #x    b,n,s,h
+        x_fp8 = x.clone()
+        selected = x[:,:,mask,:]  # 转为 FP8
+        
+        scale = selected.abs().amax(dim=(-1, -2), keepdim=True).clamp(min=1e-7) / max_fp8_val  # shape: (B, H, 1
+        
+        # scale=1
+        selected_scaled = (selected / scale).to(torch.float8_e4m3fn)
+        
+        selected=(selected_scaled).to(torch.float16)* scale # 再转回 BF16
+        x_fp8[:,:,mask,:] = selected  
+        return x_fp8
+    def quantize_selected_int4(x, mask, max_int4_val=7.0):
+        # x: (b, n, s, h)
+        x_int4 = x.clone()
+        selected = x[:, :, mask, :]  # 被选中需要量化的部分
+
+        if selected.numel() == 0:
+            return x_int4  # 防止空 tensor 出错
+
+        # 计算scale：按token级别找到最大绝对值，防止溢出
+        scale = selected.abs().amax(dim=(-1, -2), keepdim=True).clamp(min=1e-7) / max_int4_val
+
+        # 归一化
+        selected_scaled = selected / scale  # 现在理论上是 [-7, 7]
+
+        # 量化到 int4范围，并且四舍五入
+        selected_quant = selected_scaled.round().clamp(min=-8, max=7).to(torch.int8)  # int8存储，但只用到[-8,7]
+
+        # 反量化回 float16
+        selected_dequant = (selected_quant.to(torch.float16)) * scale
+
+        # 把量化再还原的值写回去
+        x_int4[:, :, mask, :] = selected_dequant
+
+        return x_int4
+    
+    if is_int4 is True:
+        key_states2=quantize_selected_int4(key_states, mask)
+        v_states2=quantize_selected_int4(v_states,mask)
+        return key_states2,v_states2
+
+    else:
+        key_states2=quantize_selected(key_states, mask)
+        v_states2=quantize_selected(v_states,mask)
+    
+        return key_states2,v_states2
+
+def get_attn_score(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    
+    # socre_last2k=torch.matmul(query[:,:,-2048:,:], key_states.transpose(2, 3)) 
+    # chunk_size=2k
+    len=[]
+    chunk_size = 1024
+    B, num_heads, Q_len, dim = query.shape  # 假设 query 是 (B, H, Q_len, D)
+    _, _, K_len, _ = key_states.shape
+    attn_weights_all=[]
+    
+    #[b(1), seq_len]
+    final_score = torch.zeros(Q_len,dtype=query.dtype, device=query.device)
+    
+    #[n_head, seq_len,seq_len]
+    
+    for start in range(0, Q_len, chunk_size): #B, H, Q_len, D
+        # print("cc")
+        end = min(start + chunk_size, Q_len)
+        query_chunk = query[:, :, start:end, :]  # shape: (B, H, chunk_len, D)
+
+        # key_states.transpose(2, 3): shape becomes (B, H, D, K_len)
+        attn_weights_chunk = torch.matmul(query_chunk, key_states.transpose(2, 3)) * scaling  # (B, H, chunk_len, K_len)
+
+        if attention_mask is not None:
+            # Slice对应 chunk 的 causal_mask
+            chunk_causal_mask = attention_mask[:, :, start:end, :K_len]  # 注意这里的 start:end
+            attn_weights_chunk = attn_weights_chunk + chunk_causal_mask
+        
+        
+        # tmp_sigmoid =  nn.functional.sigmoid(attn_weights_chunk).to(query.dtype)
+        tmp_sigmoid = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query.dtype)
+
+        
+        
+        # 按照max取
+        #B, H, Q_len_chunk, Q_len
+        # tmp_sigmoid_max_by_head = tmp_sigmoid.max(dim=1).values
+        tmp_sigmoid_max_by_head = tmp_sigmoid.mean(dim=1)
+
+        #B Q_len_chunk,Q_len
+        
+        # row_max = tmp_sigmoid_max_by_head.max(dim=1).values  # [L1]
+        # 按列取 max（key 视角）
+        # col_max = tmp_sigmoid_max_by_head.sum(dim=2)  # [L2]
+        row_max = tmp_sigmoid_max_by_head.sum(dim=1)  # [L2]
+
+        # attn_weights_chunk = nn.functional.softmax(attn_weights_chunk, dim=-1, dtype=torch.float32).to(query.dtype)
+
+        # attn_weights_all.append(attn_weights_chunk)
+        # final_score=torch.max(final_score,row_max[0,:])
+        final_score[start:end] = torch.add(final_score[start:end], row_max[0, start:end])
+
+        
+    return final_score
 
 class Qwen2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -146,7 +273,23 @@ class Qwen2Attention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        import os
+        self.is_int4 = os.getenv("IS_INT4", "True") == "True"  # 默认为True
+        self.quant_level = int(os.getenv("QUANT_LEVEL", 0))  # 默认为0
+        
+        self.ratio=None
+        if self.is_int4:
+            self.ratio=0.8
+        elif not self.is_int4:
+            self.ratio=0.8
+        else:
+            assert False
+        self.ratio = float(os.getenv("RATIO", self.ratio))  # 默认为0.65
 
+        if self.quant_level==2:
+            self.ratio=1.0
+        print("OS QUANT_LEVEL:", os.environ.get('QUANT_LEVEL'))
+        print("qwenmodel is_int4:", self.is_int4, " qwen uant_level:", self.quant_level, " qwen ratio:",self.ratio)
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -166,10 +309,21 @@ class Qwen2Attention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
+        
+        PREFILL=False
+        if hidden_shape[1]>1:
+            PREFILL=True
+            
+        CHUNK_THRESHOLD = 4096  # 4K分块界限
+        # CHUNK_THRESHOLD = 35649  # 4K分块界限
+
+        seq_len = query_states.shape[2]
+        
+        if not PREFILL and past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
 
         sliding_window = None
         if (
@@ -189,21 +343,103 @@ class Qwen2Attention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=sliding_window,  # main diff with Llama
-            **kwargs,
-        )
+        
+        if   PREFILL:  # 仅生成阶段且长度超限时分块
+            # 初始化输出 & 分块次数
+            attn_output_chunk = torch.zeros_like(query_states).transpose(1,2)
+            num_chunks = (seq_len + CHUNK_THRESHOLD - 1) // CHUNK_THRESHOLD
+            
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * CHUNK_THRESHOLD
+                end = min((chunk_idx + 1) * CHUNK_THRESHOLD, seq_len)
+                chunk_length = end - start
+                
+                # 提取当前块的Q，使用全量K/V（Key包含历史）
+                query_chunk = query_states[:, :, start:end, :]
+                key_chunk = key_states[:, :, :end, :]  # Key逐步覆盖历史
+                value_chunk = value_states[:, :, :end, :]
+                
+            
+                
+                # 分块Attention计算 ---------------------------------------------------
+                if attention_mask is not None:
+                    mask_chunk = attention_mask[..., start:end, :end]  # 因果掩码切片
+                else:
+                    mask_chunk = None
+                
+                # 调用原始Attention接口
+                
+                
+                chunk_out, chunk_weights = attention_interface(
+                    self,
+                    query_chunk,
+                    key_chunk,
+                    value_chunk,
+                    mask_chunk,
+                    dropout=0.0 if not self.training else self.attention_dropout,
+                    scaling=self.scaling,
+                    **kwargs
+                )
+                
+                if self.quant_level==1:
+                    #score量化
+                    score= get_attn_score(self,
+                        query_chunk,
+                        key_chunk,
+                        value_chunk,
+                        mask_chunk,
+                        dropout=0.0 if not self.training else self.attention_dropout,
+                        scaling=self.scaling,
+                        **kwargs,)
+                
+                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=self.ratio, is_int4=self.is_int4 )
+                    key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
+                    value_states[:, :, start:end, :]=value_out 
+                #全量化
+                if self.quant_level==2:
+                    score= torch.ones(key_states[:, :, start:end, :].shape[2],dtype=key_states.dtype, device=key_states.device)
+                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=self.ratio,is_int4=self.is_int4 )
+                    key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
+                    value_states[:, :, start:end, :]=value_out 
+                if self.quant_level==3:
+                    score= torch.rand(key_states[:, :, start:end, :].shape[2],dtype=key_states.dtype, device=key_states.device)
+                    key_out,value_out=fp8_quant_by_score(score,key_states[:, :, start:end, :],value_chunk[:, :, start:end, :],ratio=self.ratio, is_int4=self.is_int4 )
+                    key_states[:, :, start:end, :] =key_out  # Key逐步覆盖历史
+                    value_states[:, :, start:end, :]=value_out 
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+                # 累积输出
+                attn_output_chunk[:,  start:end, :,:] = chunk_out
+            attn_output=attn_output_chunk
+            attn_weights= None
+            #最后更新cache， fp量化完成后。
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+
+                    
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights
+        
+        
+        elif not PREFILL:
+            
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=sliding_window,  # main diff with Llama
+                **kwargs,
+            )
+
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights
 
 
 class Qwen2RMSNorm(nn.Module):
