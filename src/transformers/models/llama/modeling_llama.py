@@ -225,7 +225,7 @@ def fp8_quant_by_score(score, key_states, v_states, ratio, is_int4=False):
         # scale=1
         selected_scaled = (selected / scale).to(torch.float8_e4m3fn)
         
-        selected=(selected_scaled).to(torch.float16)* scale # 再转回 BF16
+        selected=(selected_scaled).to(x.dtype)* scale # 再转回 BF16
         x_fp8[:,:,mask,:] = selected  
         return x_fp8
     def quantize_selected_int4(x, mask, max_int4_val=7.0):
@@ -246,7 +246,7 @@ def fp8_quant_by_score(score, key_states, v_states, ratio, is_int4=False):
         selected_quant = selected_scaled.round().clamp(min=-8, max=7).to(torch.int8)  # int8存储，但只用到[-8,7]
 
         # 反量化回 float16
-        selected_dequant = (selected_quant.to(torch.float16)) * scale
+        selected_dequant = (selected_quant.to(x.dtype)) * scale
 
         # 把量化再还原的值写回去
         x_int4[:, :, mask, :] = selected_dequant
@@ -486,11 +486,14 @@ class LlamaAttention(nn.Module):
         self.is_causal = True
         
         import os
-        self.is_int4 = os.getenv("IS_INT4", "True") == "True"  # 默认为True
+        
+
+        self.is_int4 = self.is_int4 = os.getenv("IS_INT4", "True").lower() != "false"
+        self.chunk_size = int(os.getenv("CHUNK_SIZE", str(64 * 1024)))
+
         self.quant_level = int(os.getenv("QUANT_LEVEL", 0))  # 默认为0
         self.ratio=None
         
-        self.is_int4 =True
         if self.is_int4:
             self.ratio=0.65
         elif not self.is_int4:
@@ -502,7 +505,7 @@ class LlamaAttention(nn.Module):
         # self.quant_level=3  #0 no quant,  1 our method ,2 full 3 random
         if self.quant_level==2:
             self.ratio=1.0
-        print(" is_int4:", self.is_int4, " quant_level:", self.quant_level, " ratio:",self.ratio)
+        print(" is_int4:", self.is_int4, " quant_level:", self.quant_level, " ratio:",self.ratio, "chunk_size",self.chunk_size)
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
@@ -540,7 +543,7 @@ class LlamaAttention(nn.Module):
             #prefill阶段
         # chunk  化
             # ----------- 动态分块逻辑 ----------- 
-        CHUNK_THRESHOLD = 4096  # 4K分块界限
+        CHUNK_THRESHOLD = self.chunk_size  # 4K分块界限
         # CHUNK_THRESHOLD = 35649  # 4K分块界限
 
         seq_len = query_states.shape[2]

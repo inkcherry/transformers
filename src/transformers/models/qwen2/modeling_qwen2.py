@@ -144,13 +144,20 @@ def fp8_quant_by_score(score, key_states, v_states, ratio, is_int4=False):
         #x    b,n,s,h
         x_fp8 = x.clone()
         selected = x[:,:,mask,:]  # 转为 FP8
-        
+        if selected.numel() == 0:
+            return x_fp8
+
+        eps=1e-7
+        selected = torch.sign(selected) * torch.log1p(selected.abs() + eps)
+
         scale = selected.abs().amax(dim=(-1, -2), keepdim=True).clamp(min=1e-7) / max_fp8_val  # shape: (B, H, 1
         
         # scale=1
         selected_scaled = (selected / scale).to(torch.float8_e4m3fn)
         
         selected=(selected_scaled).to(torch.float16)* scale # 再转回 BF16
+        
+        selected = torch.sign(selected) * torch.expm1(selected.abs())
         x_fp8[:,:,mask,:] = selected  
         return x_fp8
     def quantize_selected_int4(x, mask, max_int4_val=7.0):
